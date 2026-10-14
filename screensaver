@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Show the dashboard as an xsecurelock screensaver. xsecurelock runs this script with
+`XSCREENSAVER_WINDOW` set to the window to draw in (https://github.com/google/xsecurelock). Set
+`XSECURELOCK_BLANK_TIMEOUT=-1` so that xsecurelock doesn't blank the screen after 10 minutes, and
+`XSECURELOCK_SAVER_STOP_ON_BLANK=0` so that xsecurelock keeps this script running while the monitor
+is off. This script handles the operating windows instead, e.g. it turns the monitor back on in the
+morning. It calls Xlib directly via ctypes because e.g. ImageMagick's `display -window` can't find
+xsecurelock's windows under the composite overlay window
+"""
+
+import ctypes
+import gzip
+import os
+import pathlib
+import re
+import sys
+import time
+import urllib.request
+
+URL = f"http://localhost:{re.search(r'^port: *(\d+)', pathlib.Path(__file__).with_name('config.yaml').read_text(), re.M)[1]}"
+"""Dashboard server on this machine, at the `port` from `config.yaml`. Parse it with a regex because
+PyYAML isn't in Python's standard library"""
+
+NIGHT_IDLE_SECONDS = 600
+"""Outside the operating windows, turn the monitor off after this much time without input, like the
+usual DPMS standby timeout"""
+
+
+class XScreenSaverInfo(ctypes.Structure):
+    """Result of `XScreenSaverQueryInfo()`. Only `idle` (in milliseconds) is used"""
+
+    _fields_ = [
+        ("window", ctypes.c_ulong),
+        ("state", ctypes.c_int),
+        ("kind", ctypes.c_int),
+        ("til_or_since", ctypes.c_ulong),
+        ("idle", ctypes.c_ulong),
+        ("eventMask", ctypes.c_ulong),
+    ]
+
+
+# Declare the Xlib functions that this script calls. XIDs (windows and pixmaps) are `unsigned long`
+x11 = ctypes.CDLL("libX11.so.6")
+xext = ctypes.CDLL("libXext.so.6")
+xss = ctypes.CDLL("libXss.so.1")
+for f, argtypes, restype in [
+    (x11.XOpenDisplay, [ctypes.c_char_p], ctypes.c_void_p),
+    (x11.XGetGeometry, [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), *[ctypes.POINTER(ctypes.c_int)] * 2, *[ctypes.POINTER(ctypes.c_uint)] * 4], ctypes.c_int),
+    (x11.XDefaultRootWindow, [ctypes.c_void_p], ctypes.c_ulong),
+    (x11.XDefaultVisual, [ctypes.c_void_p, ctypes.c_int], ctypes.c_void_p),
+    (x11.XCreatePixmap, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint], ctypes.c_ulong),
+    (x11.XCreateGC, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p], ctypes.c_void_p),
+    (x11.XCreateImage, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_int], ctypes.c_void_p),
+    (x11.XPutImage, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint], ctypes.c_int),
+    (x11.XSetWindowBackgroundPixmap, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong], ctypes.c_int),
+    (x11.XSetWindowBackground, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong], ctypes.c_int),
+    (x11.XClearWindow, [ctypes.c_void_p, ctypes.c_ulong], ctypes.c_int),
+    (x11.XFreePixmap, [ctypes.c_void_p, ctypes.c_ulong], ctypes.c_int),
+    (x11.XFreeGC, [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    (x11.XFree, [ctypes.c_void_p], ctypes.c_int),
+    (x11.XFlush, [ctypes.c_void_p], ctypes.c_int),
+    (x11.XResetScreenSaver, [ctypes.c_void_p], ctypes.c_int),
+    (xext.DPMSInfo, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ushort), ctypes.POINTER(ctypes.c_ubyte)], ctypes.c_int),
+    (xext.DPMSForceLevel, [ctypes.c_void_p, ctypes.c_ushort], ctypes.c_int),
+    (xss.XScreenSaverSuspend, [ctypes.c_void_p, ctypes.c_int], None),
+    (xss.XScreenSaverQueryInfo, [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XScreenSaverInfo)], ctypes.c_int),
+]:
+    f.argtypes, f.restype = argtypes, restype
+
+
+def main():
+    # Connect to X and get the window's size and depth, which xsecurelock sets before it shows the
+    # window. `XGetGeometry()` returns the root window, x, y, width, height, border width, and depth
+    if not (display := x11.XOpenDisplay(None)):
+        sys.exit("Can't open the X display")
+    window = int(os.environ["XSCREENSAVER_WINDOW"], 0)
+    geometry = [ctypes.c_ulong(), *[ctypes.c_int() for _ in range(2)], *[ctypes.c_uint() for _ in range(4)]]
+    x11.XGetGeometry(display, window, *map(ctypes.byref, geometry))
+    width, height, depth = (v.value for v in [geometry[3], geometry[4], geometry[6]])
+
+    # Suspend the X screensaver and DPMS timers while this script runs. xsecurelock stops its saver
+    # when the X screensaver activates (e.g. after `xset s 3600`), even with
+    # `XSECURELOCK_SAVER_STOP_ON_BLANK=0`. X lifts the suspension when this script exits, e.g. when
+    # the user unlocks. Also turn the X screensaver off in case it started this lock via xss-lock,
+    # because X blanks the screen while it's on
+    xss.XScreenSaverSuspend(display, True)
+    x11.XResetScreenSaver(display)
+    level, enabled, info = ctypes.c_ushort(), ctypes.c_ubyte(), XScreenSaverInfo()
+    while True:
+        # Download the frame. Ask for gzip, which shrinks a mostly black frame by about 98%.
+        # Outside the operating windows, the server responds with an empty 204
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"{URL}/frame.bgra?size={width},{height}", headers={"Accept-Encoding": "gzip"}), timeout=60) as response:
+                frame = response.read()
+                if response.headers.get("Content-Encoding") == "gzip":
+                    frame = gzip.decompress(frame)
+        except OSError as e:
+            print("Failed to download the frame:", e, file=sys.stderr)
+            frame = b""
+
+        # Read the monitor's DPMS state. Without DPMS, there's no monitor to turn on or off
+        xext.DPMSInfo(display, ctypes.byref(level), ctypes.byref(enabled))
+
+        # Draw the frame only if it's complete, because Xlib would read past the end of a short
+        # one
+        if len(frame) == width * height * 4:
+            # Turn the monitor on, e.g. at the start of an operating window
+            if enabled.value and level.value != 0:
+                xext.DPMSForceLevel(display, 0)
+
+            # Set the frame as the window's background, so that X repaints it by itself, e.g.
+            # after xsecurelock's password prompt closes. The server keeps the pixmap until the
+            # background changes, so free this script's handle right away
+            pixmap = x11.XCreatePixmap(display, window, width, height, depth)
+            gc = x11.XCreateGC(display, pixmap, 0, None)
+            image = x11.XCreateImage(display, x11.XDefaultVisual(display, 0), depth, 2, 0, frame, width, height, 32, 0)
+            x11.XPutImage(display, pixmap, gc, image, 0, 0, 0, 0, width, height)
+            x11.XSetWindowBackgroundPixmap(display, window, pixmap)
+            # Use `XFree()`, not `XDestroyImage()`, which would also free Python's `frame` bytes
+            x11.XFree(image)
+            x11.XFreeGC(display, gc)
+            x11.XFreePixmap(display, pixmap)
+        else:
+            # Outside the operating windows (or if the server is down), show black. Turn the
+            # monitor off after some time without input, so that input still wakes it to type
+            # the password
+            x11.XSetWindowBackground(display, window, 0)
+            xss.XScreenSaverQueryInfo(display, x11.XDefaultRootWindow(display), ctypes.byref(info))
+            if enabled.value and level.value == 0 and info.idle >= NIGHT_IDLE_SECONDS * 1000:
+                xext.DPMSForceLevel(display, 3)
+        x11.XClearWindow(display, window)
+        x11.XFlush(display)
+
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()

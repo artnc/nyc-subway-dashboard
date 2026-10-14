@@ -1,0 +1,41 @@
+# Stations to show
+# - name: Station name from https://www.mta.info/map/5256 or LIRR/PATH station name. If the map name
+#   is wrong, consult https://data.ny.gov/Transportation/MTA-Subway-Stations/39hk-dx4f/data_preview
+# - platforms: List of station platforms to show. Examples of acceptable values are "downtown 2/3",
+#   "J/Z" (to show both uptown and downtown), "east LIRR", "west LIRR", "NJ PATH", "NY PATH"
+# - minutesToPlatform: How long it takes you to reach the platform starting from wherever you're
+#   viewing this dashboard. Trains that arrive sooner than this will be hidden
+stations:
+  - name: "Rector St"
+    platforms: ["uptown 1"]
+    minutesToPlatform: 5
+  - name: "Rector St"
+    platforms: ["R/W"]
+    minutesToPlatform: 6
+  - name: "Wall St"
+    platforms: ["4/5"]
+    minutesToPlatform: 8
+  - name: "Wall St"
+    platforms: ["downtown 2/3"]
+    minutesToPlatform: 11
+  - name: "Fulton St"
+    platforms: ["A/C"]
+    minutesToPlatform: 10
+  - name: "Broad St"
+    platforms: ["uptown J/Z"]
+    minutesToPlatform: 10
+  - name: "World Trade Center"
+    platforms: ["uptown E", "NJ PATH"]
+    minutesToPlatform: 10
+
+# When to turn the screen on, as [start, end] windows in 24-hour NYC time. A window can span
+# midnight, e.g. ["22:00", "2:00"]. Omit this to keep the screen on 24/7. Quotes are necessary
+operatingHours:
+  - ["9:00", "21:00"]
+
+# Server port. Run `docker compose restart` after changing this
+port: 10001
+
+# Raspberry Pi only: degrees to rotate the dashboard counterclockwise. Omit this (or use 0) for a
+# landscape monitor, use 90 or 270 for portrait
+displayRotateDegrees: 90
